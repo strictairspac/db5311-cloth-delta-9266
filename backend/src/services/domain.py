@@ -2,7 +2,7 @@
 
 from collections import Counter
 
-from src.services import cloth_stock
+from src.services import cloth_ledger, cloth_stock
 from src.services.cloth_quota import warehouse_plan
 
 
@@ -135,25 +135,106 @@ def _conflict_report(index, event, stored, audit):
     }
 
 
-def solve(payload, engine):
+def solve(payload, engine, case_id=None, run_id=None):
     validate(payload)
     audit = []
     counts = Counter()
     with engine.begin() as conn:
         cloth_stock.initialize(conn)
-        for row in payload['opening_batches']:
-            cloth_stock.apply_revision(conn, {**row, 'action': BOOK})
-        for index, event in enumerate(payload['revisions'], 1):
-            status, retracted, added = cloth_stock.apply_revision(conn, event)
-            if status == '版本冲突':
-                return _conflict_report(index, event, retracted, audit)
-            counts[status] += 1
-            audit.append(_audit_row(index, event, status, retracted, added))
+        if case_id is None:
+            # 独立试算（无档案上下文）：仍按单事务临时表产出完整证据。
+            for row in payload['opening_batches']:
+                cloth_stock.apply_revision(conn, {**row, 'action': BOOK})
+            for index, event in enumerate(payload['revisions'], 1):
+                status, retracted, added = cloth_stock.apply_revision(conn, event)
+                if status == '版本冲突':
+                    return _conflict_report(index, event, retracted, audit)
+                counts[status] += 1
+                audit.append(_audit_row(index, event, status, retracted, added))
+        else:
+            # 同一档案续收复秤：临时表完全从持久账本重放，每次运行都是幂等重算。
+            shipped_rows, _ = cloth_ledger.outbound_reconciliation(conn, case_id)
+            shipped_batches = {row['batch_id'] for row in shipped_rows}
+            ledger_current = conn.execute(
+                cloth_ledger.cloth_ledger.select().where(
+                    cloth_ledger.cloth_ledger.c.case_id == case_id)).mappings().all()
+            if not ledger_current:
+                # 首次运行：期初在库批次登记进持久账本。
+                for row in payload['opening_batches']:
+                    cloth_ledger.register_revision(conn, case_id, {**row, 'action': BOOK}, run_id)
+                ledger_current = conn.execute(
+                    cloth_ledger.cloth_ledger.select().where(
+                        cloth_ledger.cloth_ledger.c.case_id == case_id)).mappings().all()
+            known = {(row['batch_id'], row['revision']): dict(row) for row in ledger_current}
+            known_adjustments = {(row['batch_id'], row['revision']): dict(row) for row in conn.execute(
+                cloth_ledger.outbound_adjustments.select().where(
+                    cloth_ledger.outbound_adjustments.c.case_id == case_id)).mappings()}
+            # 本次运行只登记账本中尚不存在的新事件；身份已存在则比对内容识别重复或冲突。
+            run_events = []
+            for event in payload['revisions']:
+                identity = (event['batch_id'], event['revision'])
+                if event['batch_id'] in shipped_batches:
+                    # 已出库批次后来补传复秤：只登记出库调整，绝不触碰在库。
+                    if identity in known_adjustments:
+                        stored = known_adjustments[identity]
+                        if all(stored[key] == event[key] for key in
+                               ('action', 'grade', 'weight_g', 'pieces')):
+                            run_events.append(('出库后补传', '重复', event))
+                            continue
+                        return _conflict_report(len(audit) + 1, event, stored, audit)
+                    adjustment = {
+                        'batch_id': event['batch_id'],
+                        'outbound_revision': next(
+                            row['revision'] for row in shipped_rows
+                            if row['batch_id'] == event['batch_id']),
+                        'revision': event['revision'], 'action': event['action'],
+                        'grade': event['grade'], 'weight_g': event['weight_g'],
+                        'pieces': event['pieces']}
+                    try:
+                        cloth_ledger.register_outbound_adjustment(conn, case_id, adjustment)
+                    except cloth_ledger.LedgerConflict as exc:
+                        _, stored = exc.args
+                        return _conflict_report(len(audit) + 1, event, stored, audit)
+                    run_events.append(('出库后补传', '生效', event))
+                    continue
+                if identity in known:
+                    stored = known[identity]
+                    if all(stored[key] == event[key] for key in
+                           ('action', 'grade', 'weight_g', 'pieces')):
+                        run_events.append(('账本', '重复', event))
+                    else:
+                        return _conflict_report(len(audit) + 1, event, stored, audit)
+                    continue
+                try:
+                    status = cloth_ledger.register_revision(conn, case_id, event, run_id)
+                except cloth_ledger.LedgerConflict as exc:
+                    event2, stored = exc.args
+                    return _conflict_report(len(audit) + 1, event2, stored, audit)
+                run_events.append(('账本', status, event))
+            # 从持久账本全量重放（已出库批次除外），重建临时库存与修订轨迹。
+            ledger_rows = conn.execute(
+                cloth_ledger.cloth_ledger.select().where(
+                    cloth_ledger.cloth_ledger.c.case_id == case_id)
+                .order_by(cloth_ledger.cloth_ledger.c.sequence)).mappings().all()
+            for row in ledger_rows:
+                if row['batch_id'] in shipped_batches:
+                    continue
+                event = {key: row[key] for key in
+                         ('batch_id', 'revision', 'action', 'grade', 'weight_g', 'pieces')}
+                cloth_stock.apply_revision(conn, event)
+            for index, (kind, status, event) in enumerate(run_events, 1):
+                if kind == '出库后补传':
+                    counts['出库后补传'] += 1
+                    audit.append(_audit_row(index, event, '出库后补传', None, None))
+                else:
+                    counts[status] += 1
+                    audit.append(_audit_row(index, event, status, None, None))
 
         reconciled = conn.execute(cloth_stock.RECONCILE).mappings().all()
         differences = sum(row['differs'] for row in reconciled)
         metrics = {
             '生效修订数': counts['生效'], '重复修订数': counts['重复'], '过期修订数': counts['过期'],
+            '出库后补传数': counts['出库后补传'],
             '核对库存等级数': len(reconciled), '库存差异等级数': differences,
         }
         sections = [
@@ -169,6 +250,24 @@ def solve(payload, engine):
             return {'summary': f'{differences} 个等级库存存在差异，暂停本次仓位与转裁发单。',
                     'metrics': metrics, 'sections': sections}
         active_batches = conn.execute(cloth_stock.ACTIVE_BATCHES).mappings().all()
+        if case_id is not None:
+            # 已整批签收出库的批次从下次在库量中扣掉。
+            superseded = cloth_ledger.mark_superseded_lines(conn, case_id)
+            metrics['版本失效配额行数'] = superseded
+            if shipped_rows:
+                sections.append({'title': '已出库批次（在库量已扣除）', 'rows': [
+                    {'批次': row['batch_id'], '修订号': row['revision'], '等级': row['grade'],
+                     '出库重量（克）': row['weight_g'], '出库件数': row['pieces'],
+                     '签收人': row['shipped_by'], '签收时间': row['shipped_at']}
+                    for row in shipped_rows]})
+            _, adjustments = cloth_ledger.outbound_reconciliation(conn, case_id)
+            if adjustments:
+                sections.append({'title': '出库后补传复秤（仅修正出库对账）', 'rows': [
+                    {'批次': row['batch_id'], '出库修订号': row['outbound_revision'],
+                     '补传修订号': row['revision'], '动作': row['action'], '等级': row['grade'],
+                     '重量（克）': row['weight_g'], '件数': row['pieces'],
+                     '登记时间': row['registered_at']}
+                    for row in adjustments]})
 
     decisions, cuts, missing_quotas = warehouse_plan(reconciled, active_batches, payload['quotas'])
     metrics.update({'建议转裁批次数': len(cuts), '缺少配额等级数': missing_quotas})

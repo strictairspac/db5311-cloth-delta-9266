@@ -50,3 +50,9 @@ def reviewer(user=Depends(current_user)):
     if user['role'] != Role.REVIEWER:
         raise HTTPException(403, '需要复核员权限')
     return user['sub']
+
+
+def viewer(user=Depends(current_user)):
+    if user['role'] != Role.VIEWER:
+        raise HTTPException(403, '需要裁切组观察员权限')
+    return user['sub']
